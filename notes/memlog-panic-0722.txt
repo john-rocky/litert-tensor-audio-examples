@@ -1,0 +1,7 @@
+start pid=3507 98.87 594.14
+98.99 MemAvailable: 4653188 kB | VmRSS:	 152712 kB
+100.20 MemAvailable: 3092636 kB | VmRSS:	 893936 kB
+101.44 MemAvailable: 1599468 kB | VmRSS:	 3229000 kB
+104.38 MemAvailable: 0 kB | VmRSS:	 4867228 kB
+107.77 MemAvailable: 0 kB | VmRSS:	 3581696 kB
+128.50 MemAvailable: 0 kB | VmRSS:	 2039540 kB

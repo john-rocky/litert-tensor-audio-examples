@@ -48,3 +48,19 @@ companion file. See `verify/audio_smoke.py --help` for the pipeline flags.
 - Codec on GPU: 17.6 ms (Mali) / 47.4 ms (Metal) per 89-frame window.
 - KV-cache rebind by buffer handle is zero-copy and in-place-DUS-eligible;
   naive copy-rebind costs +24%/frame (M4) / +35%/frame (Pixel 8a).
+
+## attn_bench: odml.runtime_bmm vs sdpa vs raw attention
+
+`talker_step/attn_bench.cc` benchmarks the talker's decode attention three
+ways at identical inputs - raw ops, `odml.scaled_dot_product_attention`, and
+the `odml.runtime_bmm` composite pair - with the CPU decompositions doubling
+as the numeric reference. On M4 Max Metal fp32 the runtime_bmm form runs a
+28-block frame in 0.76-0.85 ms vs 2.55 ms for raw ops (3x), exact at every
+cache fill level. Full results, the sound composition for the softmax between
+two bounded matmuls ("avbound"), and per-backend findings:
+`notes/runtime-bmm-bench.md`.
+
+`talker_step/oom_repro/` holds the device-side scripts (1 Hz MemAvailable +
+RSS logging, fsync per line) used to capture the Mali delegate-init OOM
+timeline in `notes/memlog-panic-0722.txt`. WARNING: running the launcher on
+an 8 GB phone kernel-panics and reboots it - supervised runs only.

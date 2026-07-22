@@ -80,6 +80,36 @@ cc_binary(
 )
 
 cc_binary(
+    name = "attn_bench",
+    srcs = ["attn_bench.cc"],
+    copts = select({
+        "//litert:android": [],
+        "//conditions:default": ["-DGOOGLE_COMMANDLINEFLAGS_FULL_API=1"],
+    }) + commandline_flag_copts(),
+    data = litert_gpu_accelerator_prebuilts(),
+    linkopts = litert_android_linkopts(),
+    deps = [
+        "//litert/cc:litert_api_with_dynamic_runtime",
+        "//litert/cc:litert_common",
+        "//litert/cc:litert_environment",
+        "//litert/cc:litert_options",
+        "//litert/cc/options:litert_gpu_options",
+        "//tensor",
+        "//tensor:arithmetic",
+        "//tensor:buffer",
+        "//tensor:datatypes",
+        "//tensor/backends/tflite:arithmetic_tflite",
+        "//tensor/backends/tflite:tflite_flatbuffer_conversion",
+        "//tensor/runners/litert:litert_dynamic_runner",
+        "@com_google_absl//absl/flags:flag",
+        "@com_google_absl//absl/flags:parse",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/strings",
+        "@flatbuffers",
+    ],
+)
+
+cc_binary(
     name = "talker_main",
     srcs = ["talker_main.cc"],
     copts = select({
