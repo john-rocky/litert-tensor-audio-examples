@@ -59,10 +59,27 @@
 #include "tensor/backends/tflite/tflite_flatbuffer_conversion.h"
 #include "tensor/buffer.h"
 #include "tensor/datatypes.h"
+#include "tensor/runners/litert/feedback_loop_config.h"
 #include "tensor/runners/litert/litert_dynamic_runner.h"
 #include "tensor/tensor.h"
 
 ABSL_FLAG(std::string, variant, "raw", "raw|sdpa|rbmm|cache_rbmm");
+ABSL_FLAG(std::string, multi_host_cache, "zeros",
+          "cache_rbmm multi_steps: what the measured GPU runner's host cache "
+          "inputs carry per step. zeros = all-zero every step; real = true "
+          "prefix rows every step; once = bind zeros at pos=0 then never "
+          "re-set (probes whether re-binding resets delegate cache state)");
+ABSL_FLAG(bool, feedback_loops, false,
+          "cache_rbmm multi_steps: register cache_k/v as FeedbackLoopConfig "
+          "pairs (PR #8796 runner API): caches become signature outputs, the "
+          "runner swaps input<->output buffers between Run() calls, and the "
+          "GPU runs in external-tensors mode. Host cache inputs are never "
+          "bound (the swap chain owns them; unwritten rows are never read).");
+ABSL_FLAG(int, multi_steps, 0,
+          "cache_rbmm only: run N chained decode steps (pos = 0..N-1) on one "
+          "runner instance and verify each step against the CPU reference. "
+          "The GPU runner gets ZEROED host cache inputs, so agreement proves "
+          "the delegate-managed cache accumulates across Run() calls.");
 ABSL_FLAG(bool, cache_qk_bound, false,
           "cache_rbmm only: bound the QK side with the active length instead "
           "of running it unbounded (probes the intended composition for "
@@ -299,7 +316,9 @@ TfTensor CacheRbmmStep(const Geometry& g, const TfTensor& q,
                        const TfTensor& mask, const TfTensor& param,
                        const TfTensor& param_full, const TfTensor& cache_k_in,
                        const TfTensor& cache_v_in, const TfTensor& pos_k,
-                       const TfTensor& pos_v, bool qk_bound) {
+                       const TfTensor& pos_v, bool qk_bound,
+                       TfTensor* cache_k_out = nullptr,
+                       TfTensor* cache_v_out = nullptr) {
   const float scale = 1.0f / std::sqrt(static_cast<float>(g.head_dim));
   StableHLOCompositeOptions cu_opts{
       .name = "odml.cache_update",
@@ -321,6 +340,8 @@ TfTensor CacheRbmmStep(const Geometry& g, const TfTensor& q,
   TfTensor cache_v_new = std::get<1>(caches);
   cache_k_new.SetName("cache_k_new");
   cache_v_new.SetName("cache_v_new");
+  if (cache_k_out != nullptr) *cache_k_out = cache_k_new;
+  if (cache_v_out != nullptr) *cache_v_out = cache_v_new;
 
   TfTensor lhs = Mul(q, Const1(scale));
   StableHLOCompositeOptions qk_opts{
@@ -413,6 +434,90 @@ std::vector<float> MakeMask(int max_seq, int active) {
   return m;
 }
 
+// One cache_rbmm decode step's inputs: the step writes position `pos` and
+// attends over [0, active) (active = pos + 1 in a plain decode loop). The
+// host cache inputs carry the prefix rows [0, pos) — they feed only the CPU
+// decomposition. zero_host_caches hands the measured GPU runner all-zero
+// host caches instead: the delegate path never reads them, so agreement
+// with the CPU reference then PROVES the delegate-managed cache persisted
+// across Run() calls.
+enum class HostCacheMode { kReal, kZeros, kSkip };
+
+absl::Status SetCacheStepInputs(LitertDynamicRunner& runner,
+                                const Geometry& g, const HostData& data,
+                                int pos, int active,
+                                HostCacheMode cache_mode) {
+  auto st = runner.SetInput("main", "q",
+                            Create("q", Type::kFP32,
+                                   {1, g.groups, g.group_sz, g.head_dim},
+                                   std::vector<float>(data.q)));
+  if (!st.ok())
+    return absl::InternalError(absl::StrCat("q: ", st.message()));
+  std::vector<float> row_k(static_cast<size_t>(g.groups) * g.head_dim);
+  std::vector<float> row_v(row_k.size());
+  for (int gi = 0; gi < g.groups; ++gi)
+    for (int di = 0; di < g.head_dim; ++di) {
+      size_t src = (static_cast<size_t>(gi) * g.max_seq + pos) * g.head_dim +
+                   di;
+      row_k[static_cast<size_t>(gi) * g.head_dim + di] = data.k[src];
+      row_v[static_cast<size_t>(gi) * g.head_dim + di] = data.v[src];
+    }
+  st = runner.SetInput("main", "src_k",
+                       Create("src_k", Type::kFP32,
+                              {1, g.groups, 1, g.head_dim},
+                              std::move(row_k)));
+  if (!st.ok()) return absl::InternalError(absl::StrCat("src_k: ", st.message()));
+  st = runner.SetInput("main", "src_v",
+                       Create("src_v", Type::kFP32,
+                              {1, g.groups, 1, g.head_dim},
+                              std::move(row_v)));
+  if (!st.ok()) return absl::InternalError(absl::StrCat("src_v: ", st.message()));
+  const size_t cache_elems =
+      static_cast<size_t>(g.groups) * g.max_seq * g.head_dim;
+  if (cache_mode != HostCacheMode::kSkip) {
+    st = runner.SetInput("main", "cache_k_in",
+                         Create("cache_k_in", Type::kFP32,
+                                {1, g.groups, g.max_seq, g.head_dim},
+                                cache_mode == HostCacheMode::kZeros
+                                    ? std::vector<float>(cache_elems, 0.0f)
+                                    : PackBnsd(g, data.k, pos, 0.0f)));
+    if (!st.ok()) return absl::InternalError(absl::StrCat("cache_k_in: ", st.message()));
+    st = runner.SetInput("main", "cache_v_in",
+                         Create("cache_v_in", Type::kFP32,
+                                {1, g.groups, g.head_dim, g.max_seq},
+                                cache_mode == HostCacheMode::kZeros
+                                    ? std::vector<float>(cache_elems, 0.0f)
+                                    : PackTransposed(g, data.v, pos, 0.0f)));
+    if (!st.ok()) return absl::InternalError(absl::StrCat("cache_v_in: ", st.message()));
+  }
+  std::vector<int32_t> p(7, active);
+  p[0] = pos;
+  st = runner.SetInput("main", "param",
+                       Create("param", Type::kI32, {1, 1, 1, 7},
+                              std::move(p)));
+  if (!st.ok()) return absl::InternalError(absl::StrCat("param: ", st.message()));
+  std::vector<int32_t> pf(7, g.max_seq);
+  pf[0] = pos;
+  pf[1] = active;
+  st = runner.SetInput("main", "param_full",
+                       Create("param_full", Type::kI32, {1, 1, 1, 7},
+                              std::move(pf)));
+  if (!st.ok()) return absl::InternalError(absl::StrCat("param_full: ", st.message()));
+  st = runner.SetInput("main", "pos_k",
+                       Create("pos_k", Type::kI32, {4},
+                              std::vector<int32_t>{0, 0, pos, 0}));
+  if (!st.ok()) return absl::InternalError(absl::StrCat("pos_k: ", st.message()));
+  st = runner.SetInput("main", "pos_v",
+                       Create("pos_v", Type::kI32, {4},
+                              std::vector<int32_t>{0, 0, 0, pos}));
+  if (!st.ok()) return absl::InternalError(absl::StrCat("pos_v: ", st.message()));
+  st = runner.SetInput("main", "mask",
+                       Create("mask", Type::kFP32, {1, 1, 1, g.max_seq},
+                              MakeMask(g.max_seq, active)));
+  if (!st.ok()) return absl::InternalError(absl::StrCat("mask: ", st.message()));
+  return absl::OkStatus();
+}
+
 absl::Status SetCommonInputs(LitertDynamicRunner& runner,
                              const Geometry& g, const std::string& variant,
                              const HostData& data, int active, float canary,
@@ -421,68 +526,8 @@ absl::Status SetCommonInputs(LitertDynamicRunner& runner,
   if (variant == "cache_rbmm") {
     // The step writes position active-1; the cache inputs carry positions
     // [0, active-1) and the composite adds the last row.
-    const int pos = active - 1;
-    st = runner.SetInput("main", "q",
-                         Create("q", Type::kFP32,
-                                {1, g.groups, g.group_sz, g.head_dim},
-                                std::vector<float>(data.q)));
-    if (!st.ok())
-      return absl::InternalError(absl::StrCat("q: ", st.message()));
-    std::vector<float> row_k(static_cast<size_t>(g.groups) * g.head_dim);
-    std::vector<float> row_v(row_k.size());
-    for (int gi = 0; gi < g.groups; ++gi)
-      for (int di = 0; di < g.head_dim; ++di) {
-        size_t src = (static_cast<size_t>(gi) * g.max_seq + pos) * g.head_dim +
-                     di;
-        row_k[static_cast<size_t>(gi) * g.head_dim + di] = data.k[src];
-        row_v[static_cast<size_t>(gi) * g.head_dim + di] = data.v[src];
-      }
-    st = runner.SetInput("main", "src_k",
-                         Create("src_k", Type::kFP32,
-                                {1, g.groups, 1, g.head_dim},
-                                std::move(row_k)));
-    if (!st.ok()) return absl::InternalError(absl::StrCat("src_k: ", st.message()));
-    st = runner.SetInput("main", "src_v",
-                         Create("src_v", Type::kFP32,
-                                {1, g.groups, 1, g.head_dim},
-                                std::move(row_v)));
-    if (!st.ok()) return absl::InternalError(absl::StrCat("src_v: ", st.message()));
-    st = runner.SetInput("main", "cache_k_in",
-                         Create("cache_k_in", Type::kFP32,
-                                {1, g.groups, g.max_seq, g.head_dim},
-                                PackBnsd(g, data.k, pos, 0.0f)));
-    if (!st.ok()) return absl::InternalError(absl::StrCat("cache_k_in: ", st.message()));
-    st = runner.SetInput("main", "cache_v_in",
-                         Create("cache_v_in", Type::kFP32,
-                                {1, g.groups, g.head_dim, g.max_seq},
-                                PackTransposed(g, data.v, pos, 0.0f)));
-    if (!st.ok()) return absl::InternalError(absl::StrCat("cache_v_in: ", st.message()));
-    std::vector<int32_t> p(7, active);
-    p[0] = pos;
-    st = runner.SetInput("main", "param",
-                         Create("param", Type::kI32, {1, 1, 1, 7},
-                                std::move(p)));
-    if (!st.ok()) return absl::InternalError(absl::StrCat("param: ", st.message()));
-    std::vector<int32_t> pf(7, g.max_seq);
-    pf[0] = pos;
-    pf[1] = active;
-    st = runner.SetInput("main", "param_full",
-                         Create("param_full", Type::kI32, {1, 1, 1, 7},
-                                std::move(pf)));
-    if (!st.ok()) return absl::InternalError(absl::StrCat("param_full: ", st.message()));
-    st = runner.SetInput("main", "pos_k",
-                         Create("pos_k", Type::kI32, {4},
-                                std::vector<int32_t>{0, 0, pos, 0}));
-    if (!st.ok()) return absl::InternalError(absl::StrCat("pos_k: ", st.message()));
-    st = runner.SetInput("main", "pos_v",
-                         Create("pos_v", Type::kI32, {4},
-                                std::vector<int32_t>{0, 0, 0, pos}));
-    if (!st.ok()) return absl::InternalError(absl::StrCat("pos_v: ", st.message()));
-    st = runner.SetInput("main", "mask",
-                         Create("mask", Type::kFP32, {1, 1, 1, g.max_seq},
-                                MakeMask(g.max_seq, active)));
-    if (!st.ok()) return absl::InternalError(absl::StrCat("mask: ", st.message()));
-    return absl::OkStatus();
+    return SetCacheStepInputs(runner, g, data, /*pos=*/active - 1, active,
+                              HostCacheMode::kReal);
   }
   if (variant == "raw" || variant == "rbmm") {
     std::vector<int> q_shape = variant == "raw"
@@ -580,6 +625,8 @@ absl::Status RunBench() {
   std::vector<TensorHandle> inputs;
   TfTensor out;
   TfTensor attn0;
+  TfTensor cache_k_new_out;
+  TfTensor cache_v_new_out;
   TfTensor mask({.name = "mask",
                  .type = Type::kFP32,
                  .shape = {1, 1, 1, g.max_seq}});
@@ -687,7 +734,8 @@ absl::Status RunBench() {
     TfTensor step =
         CacheRbmmStep(g, q, src_k, src_v, mask, param, param_full, cache_k_in,
                       cache_v_in, pos_k, pos_v,
-                      absl::GetFlag(FLAGS_cache_qk_bound));
+                      absl::GetFlag(FLAGS_cache_qk_bound), &cache_k_new_out,
+                      &cache_v_new_out);
     out = Reshape(step, {1, g.heads, 1, g.head_dim});
     inputs = {q,          src_k, src_v, mask,  param,
               param_full, cache_k_in,   cache_v_in, pos_k, pos_v};
@@ -696,6 +744,12 @@ absl::Status RunBench() {
 
   ModelFactory factory;
   std::vector<TensorHandle> outputs = {out};
+  if (variant == "cache_rbmm" && absl::GetFlag(FLAGS_feedback_loops)) {
+    // Feedback-loop mode: the caches are signature outputs the runner swaps
+    // back into the inputs between Run() calls (PR #8796 contract).
+    outputs.push_back(cache_k_new_out);
+    outputs.push_back(cache_v_new_out);
+  }
   const bool debug_softmax =
       absl::GetFlag(FLAGS_debug_softmax) && variant == "rbmm";
   if (debug_softmax) {
@@ -723,7 +777,24 @@ absl::Status RunBench() {
   auto cpu_runner = std::move(*cpu_runner_or);
 
   const bool use_gpu = absl::GetFlag(FLAGS_accelerator) == "gpu";
+  const bool feedback = variant == "cache_rbmm" &&
+                        absl::GetFlag(FLAGS_multi_steps) > 0 &&
+                        absl::GetFlag(FLAGS_feedback_loops);
   std::unique_ptr<LitertDynamicRunner> gpu_runner;
+  // CPU feedback validation: a second, loop-registered CPU runner as the
+  // measured side; cpu_runner stays the stateless per-step reference.
+  std::unique_ptr<LitertDynamicRunner> cpu_looped;
+  if (!use_gpu && feedback) {
+    auto looped_options = ::litert::Options::Create();
+    if (!looped_options) return absl::InternalError("Options::Create failed");
+    looped_options->SetHardwareAccelerators(::litert::HwAccelerators::kCpu);
+    auto looped_or = LitertDynamicRunner::Create(
+        *env, path, *looped_options,
+        {{"cache_k_in", "cache_k_new"}, {"cache_v_in", "cache_v_new"}});
+    if (!looped_or.ok()) return looped_or.status();
+    cpu_looped =
+        std::make_unique<LitertDynamicRunner>(std::move(*looped_or));
+  }
   if (use_gpu) {
     auto options = ::litert::Options::Create();
     if (!options) return absl::InternalError("Options::Create failed");
@@ -742,12 +813,18 @@ absl::Status RunBench() {
             ::litert::GpuOptions::BufferStorageType::kTexture2D);
       }
     }
-    auto gpu_runner_or = LitertDynamicRunner::Create(*env, path, *options);
+    auto gpu_runner_or =
+        feedback
+            ? LitertDynamicRunner::Create(
+                  *env, path, *options,
+                  {{"cache_k_in", "cache_k_new"}, {"cache_v_in", "cache_v_new"}})
+            : LitertDynamicRunner::Create(*env, path, *options);
     if (!gpu_runner_or.ok()) return gpu_runner_or.status();
     gpu_runner = std::make_unique<LitertDynamicRunner>(
         std::move(*gpu_runner_or));
   }
-  LitertDynamicRunner& measured = use_gpu ? *gpu_runner : cpu_runner;
+  LitertDynamicRunner& measured =
+      use_gpu ? *gpu_runner : (cpu_looped ? *cpu_looped : cpu_runner);
 
   const HostData data = MakeHostData(g, absl::GetFlag(FLAGS_seed));
   float canary = absl::GetFlag(FLAGS_canary);
@@ -776,6 +853,101 @@ absl::Status RunBench() {
     sink.assign(data, data + lock.size() / sizeof(float));
     return absl::OkStatus();
   };
+
+  const int multi_steps = absl::GetFlag(FLAGS_multi_steps);
+  if (variant == "cache_rbmm" && multi_steps > 0) {
+    // Chained decode: one runner instance, pos = 0..N-1. Each step's CPU
+    // reference is computed statelessly from host-provided prefix rows; the
+    // measured GPU runner gets zeroed host caches (see SetCacheStepInputs),
+    // so per-step agreement proves cross-Run() cache accumulation.
+    if (multi_steps > g.max_seq) {
+      return absl::InvalidArgumentError("--multi_steps must be <= max_seq");
+    }
+    double worst_rel = 0.0;
+    int worst_step = -1;
+    std::vector<double> ms;
+    ms.reserve(multi_steps);
+    for (int pos = 0; pos < multi_steps; ++pos) {
+      const int active = pos + 1;
+      st = SetCacheStepInputs(cpu_runner, g, data, pos, active,
+                              HostCacheMode::kReal);
+      if (!st.ok()) return st;
+      st = cpu_runner.Run("main");
+      if (!st.ok()) return st;
+      std::vector<float> ref;
+      st = read_output(cpu_runner, ref);
+      if (!st.ok()) return st;
+
+      if (use_gpu || cpu_looped) {
+        const std::string hc = absl::GetFlag(FLAGS_multi_host_cache);
+        // Feedback mode: the swap chain owns the cache bindings, so never
+        // re-set them. On GPU unwritten rows are never read (masked); the
+        // CPU decomposition flows the whole buffer through DUS, so seed
+        // zeros once at pos=0 there.
+        const HostCacheMode measured_mode =
+            feedback ? (cpu_looped && pos == 0 ? HostCacheMode::kZeros
+                                               : HostCacheMode::kSkip)
+            : hc == "real" ? HostCacheMode::kReal
+            : hc == "once" ? (pos == 0 ? HostCacheMode::kZeros
+                                       : HostCacheMode::kSkip)
+                           : HostCacheMode::kZeros;
+        st = SetCacheStepInputs(measured, g, data, pos, active, measured_mode);
+        if (!st.ok()) return st;
+        auto t0 = std::chrono::steady_clock::now();
+        st = measured.Run("main");
+        auto t1 = std::chrono::steady_clock::now();
+        if (!st.ok()) return st;
+        ms.push_back(
+            std::chrono::duration<double, std::milli>(t1 - t0).count());
+        std::vector<float> got;
+        st = read_output(measured, got);
+        if (!st.ok()) return st;
+        double max_rel = 0.0;
+        size_t worst_i = 0;
+        for (size_t i = 0; i < ref.size(); ++i) {
+          double denom =
+              std::max(1e-3, std::fabs(static_cast<double>(ref[i])));
+          double rel = std::fabs(got[i] - ref[i]) / denom;
+          if (rel > max_rel) {
+            max_rel = rel;
+            worst_i = i;
+          }
+        }
+        if (max_rel > worst_rel) {
+          worst_rel = max_rel;
+          worst_step = pos;
+        }
+        if (max_rel > 1e-3 || pos < 3 || pos == multi_steps - 1 ||
+            (pos + 1) % 64 == 0) {
+          std::printf(
+              "  step pos=%d active=%d max_rel=%.3g%s got[w]=%.6f ref[w]=%.6f "
+              "ms=%.3f\n",
+              pos, active, max_rel, max_rel > 1e-3 ? " MISMATCH" : "",
+              got[worst_i], ref[worst_i], ms.back());
+        }
+      }
+    }
+    if (use_gpu || cpu_looped) {
+      std::sort(ms.begin(), ms.end());
+      const std::string mode_desc =
+          absl::GetFlag(FLAGS_feedback_loops)
+              ? "FEEDBACK LOOPS #8796"
+              : absl::StrCat("host_cache=",
+                             absl::GetFlag(FLAGS_multi_host_cache));
+      std::printf(
+          "multi_steps=%d (%s): worst max_rel=%.3g at "
+          "pos=%d -> %s; per-step median_ms=%.3f min=%.3f max=%.3f\n",
+          multi_steps, mode_desc.c_str(), worst_rel, worst_step,
+          worst_rel <= 1e-3 ? "cache state ACCUMULATES across Run() calls"
+                            : "MISMATCH — state did NOT accumulate",
+          ms[ms.size() / 2], ms.front(), ms.back());
+    } else {
+      std::cout << "multi_steps on CPU exercises only the stateless "
+                   "decomposition (host caches feed it); nothing to verify"
+                << std::endl;
+    }
+    return absl::OkStatus();
+  }
 
   for (const std::string& fs : fill_strs) {
     const int active = std::stoi(fs);

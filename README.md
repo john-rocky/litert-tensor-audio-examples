@@ -60,6 +60,16 @@ cache fill level. Full results, the sound composition for the softmax between
 two bounded matmuls ("avbound"), and per-backend findings:
 `notes/runtime-bmm-bench.md`.
 
+`--variant=cache_rbmm --multi_steps=N` chains N decode steps through the
+`odml.cache_update` + `odml.runtime_bmm` pair on one runner instance and
+verifies every step against a stateless CPU reference. `--multi_host_cache=
+zeros|real|once` probes what the delegate reads (answer: nothing - the Metal
+cache resets every Run() without a feedback loop); `--feedback_loops`
+registers the caches as PR #8796 `FeedbackLoopConfig` pairs (caches become
+signature outputs, the runner swaps input<->output buffers between runs):
+bit-exact over 64 chained steps on CPU, Metal currently fails the second
+Run() at buffer re-registration (FINDINGS #15).
+
 `talker_step/oom_repro/` holds the device-side scripts (1 Hz MemAvailable +
 RSS logging, fsync per line) used to capture the Mali delegate-init OOM
 timeline in `notes/memlog-panic-0722.txt`. WARNING: running the launcher on
@@ -70,6 +80,12 @@ an 8 GB phone kernel-panics and reboots it - supervised runs only.
 `diffusion_step/` is the second model in the coverage program: one in-graph
 denoise step (bidirectional backbone + ScatterNd-free top-k remasking),
 LLaDA-8B-compatible via `--llada` (sharded safetensors loader included, no
-weights in this repo). Shares the composite options with the talker
-(`--norms=composite`); sdpa adoption for its full-sequence attention is next
-on the coverage list (COMPOSITES.md).
+weights in this repo). Composite options: `--norms=raw|composite` (now wired
+for every shape - it was silently ignored without `--llada` before 7/22, so
+re-check any earlier 1024-dim norm numbers) and `--attention=raw|sdpa`.
+`sdpa` keeps MHA shapes plain BSND and pre-folds GQA into batched MHA
+([G, g*S, 1, D]); it is exact on Metal (real-weight probe) and -8.6%/step at
+the LLaDA shape S=1024. `sdpa_nofold` reproduces the Metal wrong-result
+claim for un-folded grouped K/V (FINDINGS #13); `sdpa_folddirect` runs the
+fold as plain ops for CPU-parity work (FINDINGS #14). CPU-parity
+verification: use `--attention=raw --norms=raw`.

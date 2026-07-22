@@ -19,8 +19,13 @@ team's call - we keep repros ready either way.
 | 9 | Gather axis-1 on 4D tensors is a hard compile fail | Metal | workaround (GQA fold, no repeat) | |
 | 10 | fp16 default precision flips greedy codec ids over long rollouts (precision, not a bug) | Metal | guidance note (fp32 option for verification) | |
 | 11 | XNNPACK blockwise-int4 fast kernels are GEMV-shape only; M>=64 GEMM (diffusion-style steps) hits a slow path on arm64 macOS and Android | CPU | open observation | int4 4.6x slower than fp32 at M=64; int4 wins only for AR decode |
-| 12 | No output->input buffer aliasing contract in the runner (naive copy pattern costs +24-35%/frame) | runtime | fixed-in-flight (LiteRT PR #8796, prompted by this finding) | we verify and post numbers when it lands |
+| 12 | No output->input buffer aliasing contract in the runner (naive copy pattern costs +24-35%/frame) | runtime | landed 7/22 (PR #8796 FeedbackLoopConfig) and verified the same day: 64 chained cache_update decode steps bit-exact on CPU via the swap chain | `attn_bench --variant=cache_rbmm --multi_steps=64 --feedback_loops`; Metal side = #15 |
+| 13 | Un-folded grouped-K/V sdpa at q_seq>1: Metal CLAIMS the composite and computes silently wrong results (single-step full-unmask probe: every generated id differs from the CPU reference while raw GPU matches it exactly); at q_seq=1 the same shape rejects cleanly to CPU | Metal | workaround (pre-fold GQA to batched MHA [G, g*S, 1, D] - exact; extends #7) | `diffusion_main --attention=sdpa_nofold` is the repro; `--attention=sdpa` auto-folds |
+| 14 | sdpa composite on CPU: the runtime substitutes its own lowering for the authored decomposition; correct (bit-exact) for plain-BSND batch-1 presentations, wrong for the folded batched presentation ([G, g*S, 1, D], batch>1 heads=1) - the same graph is exact on Metal and exact as plain ops | CPU | workaround (CPU-parity verification via `--attention=raw` or `sdpa_folddirect`) | isolated by running the identical fold body with and without the composite wrapper |
+| 15 | FeedbackLoopConfig on Metal: with external-tensors mode + swapped cache buffers, the second Run() fails at input-buffer re-registration ("The given buffer type is not supported", litert_compiled_model.cc:164; default and buffer storage both) - first Run() is exact, CPU path is exact over 64 steps | Metal | open - same-day report ready; talker cache_update adoption blocked on this | `attn_bench --variant=cache_rbmm --accelerator=gpu --multi_steps=8 --feedback_loops` |
 
 Wins adopted from the LiteRT side: odml composites confirmed in converted
 graphs (rms_norm etc.); odml.runtime_bmm adopted as the talker's attention
-(3x attention, ~4-5% e2e; `--attention=rbmm`).
+(3x attention, ~4-5% e2e; `--attention=rbmm`); odml.scaled_dot_product_
+attention adopted as the diffusion step's attention (`--attention=sdpa`:
+exact on Metal at the MHA shape, -8.6% e2e at S=1024; GQA via pre-fold).

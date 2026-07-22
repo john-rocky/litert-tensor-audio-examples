@@ -101,6 +101,7 @@ cc_binary(
         "//tensor:datatypes",
         "//tensor/backends/tflite:arithmetic_tflite",
         "//tensor/backends/tflite:tflite_flatbuffer_conversion",
+        "//tensor/runners/litert:feedback_loop_config",
         "//tensor/runners/litert:litert_dynamic_runner",
         "@com_google_absl//absl/flags:flag",
         "@com_google_absl//absl/flags:parse",
