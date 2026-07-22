@@ -57,6 +57,11 @@ ABSL_FLAG(std::string, accelerator, "cpu", "cpu|gpu");
 ABSL_FLAG(std::string, norms, "raw",
           "raw|composite - emit RMS norms as raw ops or as the "
           "odml.rms_norm composite (fused ML Drift kernels)");
+ABSL_FLAG(std::string, attention, "raw",
+          "raw|sdpa|sdpa_nofold - emit the attention core as raw fold ops or "
+          "as the odml.scaled_dot_product_attention composite (no mask; MHA "
+          "= plain BSND, GQA = group-fold presented as batched MHA). "
+          "sdpa_nofold skips the GQA fold — the Metal wrong-result repro");
 ABSL_FLAG(std::string, tflite_path, "/tmp/diffusion_step.tflite",
           "Where to write the serialized model");
 ABSL_FLAG(bool, reuse_tflite, false,
@@ -89,6 +94,16 @@ void BuildRopeCosSin(int seq, int head_dim, float base,
 }
 
 absl::Status RunDiffusion() {
+  if (const std::string n = absl::GetFlag(FLAGS_norms);
+      n != "raw" && n != "composite") {
+    return absl::InvalidArgumentError("--norms must be raw|composite");
+  }
+  if (const std::string a = absl::GetFlag(FLAGS_attention);
+      a != "raw" && a != "sdpa" && a != "sdpa_nofold" &&
+      a != "sdpa_folddirect") {
+    return absl::InvalidArgumentError(
+        "--attention must be raw|sdpa|sdpa_nofold|sdpa_folddirect");
+  }
   diffusion::DiffusionConfig config;
   if (absl::GetFlag(FLAGS_llada)) {
     // LLaDA-8B-Base (confirmed against the checkpoint config.json 2026-07-21).
@@ -101,12 +116,26 @@ absl::Status RunDiffusion() {
     config.rms_norm_eps = 1e-5f;
     config.rope_base = 500000.0f;
     config.use_qk_norm = false;
+    config.vocab = 126464;
+    config.mask_id = 126336;
+  }
+  // NOTE: this assignment used to sit inside the --llada branch, so
+  // --norms=composite was silently ignored for the default (1024-dim GQA)
+  // shape — the 7/22 "1024-dim neutral" data point was raw-vs-raw.
   config.use_rms_norm_composite = absl::GetFlag(FLAGS_norms) == "composite";
   if (config.use_rms_norm_composite) {
     std::cout << "norms: odml.rms_norm composite" << std::endl;
   }
-    config.vocab = 126464;
-    config.mask_id = 126336;
+  const std::string attention_flag = absl::GetFlag(FLAGS_attention);
+  config.use_sdpa_composite = attention_flag != "raw";
+  config.sdpa_skip_gqa_fold = attention_flag == "sdpa_nofold";
+  config.sdpa_fold_direct = attention_flag == "sdpa_folddirect";
+  if (config.use_sdpa_composite) {
+    std::cout << "attention: odml.scaled_dot_product_attention composite "
+                 "(no mask"
+              << (config.sdpa_skip_gqa_fold ? ", GQA FOLD SKIPPED — repro mode"
+                                            : "")
+              << ")" << std::endl;
   }
   config.n_layers = absl::GetFlag(FLAGS_layers);
   config.seq_len = absl::GetFlag(FLAGS_seq_len);

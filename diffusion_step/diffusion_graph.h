@@ -41,6 +41,21 @@ struct DiffusionConfig {
   // Emit RMS norms as the odml.rms_norm composite (fused ML Drift kernels;
   // decomposition = the raw math, so CPU execution is unchanged).
   bool use_rms_norm_composite = false;
+  // Emit the attention core as odml.scaled_dot_product_attention (BSND
+  // inputs, no mask — bidirectional). Decomposition = the same GqaAttention
+  // fold as the raw path, so CPU execution is numerically identical.
+  // MHA (n_kv_groups == n_heads) presents plain BSND. GQA presents the
+  // group-fold as batched MHA ([G, g*S, 1, D] q vs [G, S, 1, D] k/v):
+  // Metal CLAIMS un-folded grouped K/V at q_seq>1 but computes wrong
+  // results (2026-07-22 probe: every generated id differs from the CPU
+  // reference while raw GPU matches it exactly), so the un-folded form is
+  // kept only behind sdpa_nofold as the repro.
+  bool use_sdpa_composite = false;
+  // Repro switch for the wrong-result claim above: emit GQA sdpa WITHOUT
+  // the pre-fold. Ignored for MHA shapes (identical to use_sdpa_composite).
+  bool sdpa_skip_gqa_fold = false;
+  // Debug: run the folded-sdpa body as plain ops (no composite wrapper).
+  bool sdpa_fold_direct = false;
 
   int seq_len = 256;    // full (fixed) generation window
   int vocab = 32000;    // placeholder vocab

@@ -127,24 +127,114 @@ TfTensor GqaAttention(const TfTensor& q, const TfTensor& k, const TfTensor& v,
   return Reshape(out, {1, n_heads, S, head_dim});
 }
 
+std::vector<uint8_t> SdpaAttributes(float scale) {
+  flexbuffers::Builder fbb;
+  fbb.Map([&]() { fbb.Float("scale", scale); });
+  fbb.Finish();
+  return fbb.GetBuffer();
+}
+
+// Plain-BSND sdpa applies to MHA shapes (and to GQA only as the
+// sdpa_nofold wrong-result repro); folded GQA runs BNSD like raw.
+bool UseBsndSdpa(const DiffusionConfig& config) {
+  return config.use_sdpa_composite &&
+         (config.n_kv_groups == config.n_heads || config.sdpa_skip_gqa_fold);
+}
+
+// Full-sequence bidirectional attention as the odml.scaled_dot_product_
+// attention composite. Inputs stay BSND ([1, S, heads, dim] — the delegate
+// contract; no mask input, the model is bidirectional). The decomposition
+// transposes to BNSD and runs the same GqaAttention fold as the raw path,
+// so CPU execution matches raw exactly.
+TfTensor SdpaAttention(const DiffusionConfig& config, const TfTensor& q,
+                       const TfTensor& k, const TfTensor& v) {
+  const float scale = 1.0f / std::sqrt(static_cast<float>(config.head_dim));
+  StableHLOCompositeOptions opts{
+      .name = "odml.scaled_dot_product_attention",
+      .composite_attributes = SdpaAttributes(scale)};
+  const int n_heads = config.n_heads;
+  const int n_kv_groups = config.n_kv_groups;
+  const int head_dim = config.head_dim;
+  return StableHLOComposite(
+      opts,
+      [n_heads, n_kv_groups, head_dim](TfTensor dq, TfTensor dk, TfTensor dv) {
+        TfTensor qt = Transpose(dq, {0, 2, 1, 3});  // [1,H,S,D]
+        TfTensor kt = Transpose(dk, {0, 2, 1, 3});
+        TfTensor vt = Transpose(dv, {0, 2, 1, 3});
+        TfTensor o = GqaAttention(qt, kt, vt, n_heads, n_kv_groups, head_dim);
+        return Transpose(o, {0, 2, 1, 3});  // back to [1,S,H,D]
+      },
+      q, k, v);
+}
+
+// GQA-folded sdpa: fold groups into the batch axis OUTSIDE the composite
+// and present each group as single-head MHA over g*S query rows —
+// [G, g*S, 1, D] q vs [G, S, 1, D] k/v in BSND terms. Semantically this is
+// exactly the raw GqaAttention fold, so the kernel only ever sees an MHA
+// shape (the form Metal computes correctly). Operands arrive BNSD
+// ([1,H,S,D] / [1,G,S,D]) since the fold needs head-major memory order.
+TfTensor SdpaAttentionGqaFolded(const DiffusionConfig& config,
+                                const TfTensor& q, const TfTensor& k,
+                                const TfTensor& v) {
+  const float scale = 1.0f / std::sqrt(static_cast<float>(config.head_dim));
+  const int G = config.n_kv_groups;
+  const int g = config.n_heads / G;
+  const int S = config.seq_len;
+  const int D = config.head_dim;
+  TfTensor qf = Reshape(q, {G, g * S, 1, D});
+  TfTensor kf = Reshape(k, {G, S, 1, D});
+  TfTensor vf = Reshape(v, {G, S, 1, D});
+  StableHLOCompositeOptions opts{
+      .name = "odml.scaled_dot_product_attention",
+      .composite_attributes = SdpaAttributes(scale)};
+  const int H = config.n_heads;
+  auto body = [scale, G, g, S, D, H](TfTensor dq, TfTensor dk, TfTensor dv) {
+        // Axis-1<->2 swaps with a size-1 axis preserve linear order, so
+        // Reshape (a view) stands in for Transpose here. That keeps the
+        // decomposition op-for-op identical to the raw GqaAttention fold
+        // (same shapes into BMM/Softmax, no transpose->BMM fusion
+        // ambiguity), so CPU execution matches raw bit-for-bit.
+        TfTensor qt = Reshape(dq, {G, 1, g * S, D});
+        TfTensor kt = Reshape(dk, {G, 1, S, D});
+        TfTensor vt = Reshape(dv, {G, 1, S, D});
+        TfTensor scores = BatchMatMul(qt, kt, /*adj_x=*/false, /*adj_y=*/true);
+        scores = Reshape(scores, {1, H, S, S});
+        scores = Mul(scores, ConstF(scale));
+        TfTensor attn = Softmax(scores);
+        attn = Reshape(attn, {G, 1, g * S, S});
+        TfTensor o = BatchMatMul(attn, vt);          // [G,1,g*S,D]
+        return Reshape(o, {G, g * S, 1, D});
+      };
+  TfTensor out = config.sdpa_fold_direct
+                     ? body(qf, kf, vf)
+                     : StableHLOComposite(opts, body, qf, kf, vf);
+  return Reshape(out, {1, H, S, D});                 // back to BNSD
+}
+
 // Bidirectional GQA attention over the full sequence — no causal mask, no
 // cache. This is the structural difference from the talker step graph.
+// sdpa mode keeps everything BSND (the two BNSD transposes move inside the
+// composite decomposition, off the delegate graph); qk-norm and rope act on
+// the last axis only, so they run identically in either layout.
 TfTensor BidirectionalAttention(const DiffusionConfig& config,
                                 const TfTensor& input, const std::string& prefix,
                                 const DiffusionInputs& inputs,
                                 const WeightMap& weights) {
   int S = config.seq_len;
+  const bool bsnd = UseBsndSdpa(config);
 
   TfTensor q = FullyConnected(input, GetWeight(weights, prefix + ".q_proj.weight"));
   TfTensor k = FullyConnected(input, GetWeight(weights, prefix + ".k_proj.weight"));
   TfTensor v = FullyConnected(input, GetWeight(weights, prefix + ".v_proj.weight"));
 
   q = Reshape(q, {1, S, config.n_heads, config.head_dim});
-  q = Transpose(q, {0, 2, 1, 3});
   k = Reshape(k, {1, S, config.n_kv_groups, config.head_dim});
-  k = Transpose(k, {0, 2, 1, 3});
   v = Reshape(v, {1, S, config.n_kv_groups, config.head_dim});
-  v = Transpose(v, {0, 2, 1, 3});
+  if (!bsnd) {
+    q = Transpose(q, {0, 2, 1, 3});
+    k = Transpose(k, {0, 2, 1, 3});
+    v = Transpose(v, {0, 2, 1, 3});
+  }
 
   if (config.use_qk_norm) {
     q = RmsNorm(q, GetWeight(weights, prefix + ".q_norm.weight"),
@@ -153,13 +243,22 @@ TfTensor BidirectionalAttention(const DiffusionConfig& config,
                 config.rms_norm_eps);
   }
 
+  // BuildDenoiseStep hands rope tables pre-transposed to [1,S,1,D] in BSND
+  // mode, so ApplyRope broadcasts correctly in both layouts.
   q = ApplyRope(q, inputs.rope_cos, inputs.rope_sin);
   k = ApplyRope(k, inputs.rope_cos, inputs.rope_sin);
 
-  TfTensor out = GqaAttention(q, k, v, config.n_heads, config.n_kv_groups,
-                              config.head_dim);
-
-  out = Transpose(out, {0, 2, 1, 3});
+  TfTensor out;
+  if (bsnd) {
+    out = SdpaAttention(config, q, k, v);  // [1,S,H,D]
+  } else if (config.use_sdpa_composite) {
+    out = SdpaAttentionGqaFolded(config, q, k, v);  // BNSD in/out
+    out = Transpose(out, {0, 2, 1, 3});
+  } else {
+    out = GqaAttention(q, k, v, config.n_heads, config.n_kv_groups,
+                       config.head_dim);
+    out = Transpose(out, {0, 2, 1, 3});
+  }
   out = Reshape(out, {1, S, config.qkv_out_dim()});
   return FullyConnected(out, GetWeight(weights, prefix + ".o_proj.weight"));
 }
@@ -232,6 +331,14 @@ DiffusionOutputs BuildDenoiseStep(const DiffusionConfig& config,
   g_rms_norm_composite = config.use_rms_norm_composite;
   int S = config.seq_len;
 
+  // BSND sdpa keeps attention tensors BSND; transpose the rope tables once
+  // ([1,1,S,D] -> [1,S,1,D]) so ApplyRope broadcasts on the heads axis.
+  DiffusionInputs attn_inputs = inputs;
+  if (UseBsndSdpa(config)) {
+    attn_inputs.rope_cos = Transpose(inputs.rope_cos, {0, 2, 1, 3});
+    attn_inputs.rope_sin = Transpose(inputs.rope_sin, {0, 2, 1, 3});
+  }
+
   // --- Embedding (1-D Gather indices for the Metal delegate) ---
   TfTensor ids_flat = Reshape(inputs.token_ids, {S});  // [S]
   TfTensor hidden = Gather(GetWeight(weights, "model.embed_tokens.weight"),
@@ -245,7 +352,7 @@ DiffusionOutputs BuildDenoiseStep(const DiffusionConfig& config,
         hidden, GetWeight(weights, p + ".input_layernorm.weight"),
         config.rms_norm_eps);
     hidden = Add(hidden, BidirectionalAttention(config, attn_in,
-                                                p + ".self_attn", inputs,
+                                                p + ".self_attn", attn_inputs,
                                                 weights));
     TfTensor ffn_in = RmsNorm(
         hidden, GetWeight(weights, p + ".post_attention_layernorm.weight"),
