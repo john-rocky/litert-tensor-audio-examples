@@ -179,6 +179,10 @@ because step t's mask admits only rows 0..t, all written by steps <= t.
 ## Cross-refs
 
 - FINDINGS.md #13/#14/#15 (public repo) — one-command repros for all three.
+- notes/repro-logs-0722/ — issue-ready RAW LOGS for #13/#14/#15, regenerated
+  from the one-liners after the session (numbers reproduce bit-for-bit incl.
+  worst-element values); attach these (or a fresh capture) if Ping green-lights
+  the GitHub issues.
 - COMPOSITES.md — sdpa row (adopted for diffusion), rms row (corrected
   numbers), cache_update row (multi-step + #8796 status), adoption matrix.
 - Repro one-liners: FINDINGS #13 `diffusion_main --attention=sdpa_nofold
@@ -188,3 +192,77 @@ because step t's mask admits only rows 0..t, all written by steps <= t.
   #14 swap --attention between sdpa / sdpa_folddirect on CPU; #15
   `attn_bench --variant=cache_rbmm --accelerator=gpu --gpu_precision=fp32
   --multi_steps=8 --feedback_loops`.
+
+
+## 7/23 addendum — clean-machine re-baseline + Ping's 4 follow-ups
+
+Host idle (early morning); every arm re-run. Two 7/22 labeling/condition
+errors corrected below; talker numbers REPRODUCED, diffusion numbers were
+contaminated.
+
+### Corrections to 7/22
+
+1. PRECISION LABEL: diffusion_main had no precision flag, and the Metal
+   delegate DEFAULT is fp16 (F16 when round-to-nearest is supported,
+   delegate_metal.mm:396) - every 7/22 diffusion "fp32" GPU number was
+   actually fp16-compute. Flag added 7/23 (--gpu_precision=default|fp16|fp32).
+2. HOST CONTENTION: the 7/22 diffusion absolutes were ~2x inflated and the
+   deltas exaggerated. Clean 3-rep medians (spread <0.3%), llada 4L seq1024:
+   fp32 raw 154.1 / sdpa 148.2 (-3.8%); fp16 raw 134.8 / sdpa 131.5 (-2.5%);
+   rms fp32 153.9-154.6 (neutral); stack fp32 148.0-150.5 (~= sdpa alone).
+   seq256 fp32: raw 38.46 / sdpa 38.23 (neutral). 28L GQA seq256: fp32 raw
+   27.45 vs folded-sdpa 27.25-27.48 (NEUTRAL - the 7/22 "15-50% faster" was
+   contention amplifying dispatch overhead); rms fp32 26.4-27.2 (neutral),
+   fp16 raw 25.40 vs rms 24.46-24.50 (-3.6%).
+   Talker control (same morning): raw fp16 22.34 / stack 20.40 (-8.7%);
+   fp32 30.58 / 28.11 (-8.1%) - matches the published 22.23/20.31 and
+   30.41/28.1, so the talker campaign was clean; only the 7/22-evening
+   diffusion window was contaminated.
+3. Real-weight k=56 probe at EXPLICIT precisions: GPU raw and sdpa both
+   0/64 vs CPU at fp32 AND fp16 - the exactness claim survives with labels.
+
+### fp16 sweep (Ping 3:31 "GPU seems fp32-only") — CORRECTED same day
+
+attn_bench fill=64, default fp16, Metal: raw max_rel 0.056 (rounding-scale,
+fine); rbmm 0.069, 0.945 ms (fine); GQA sdpa = CPU-fallback bit-exact
+(known #7); cache_rbmm = max_rel 18.0. The morning read blamed fp16; the
+window-2 control showed fp32 at fill=64 mismatches IDENTICALLY (18.05) and
+fill=1 is fine at both precisions (fp32 exact, fp16 4.6e-4) -> the fill>1
+single-step mismatch is the per-Run cache-reset contract (GPU never saw
+the CPU reference's prefix rows), precision-irrelevant. FINDINGS #16
+rewritten as a harness-contract note. Lesson: the fp32 control was
+initially assumed from the 7/22 fill=1 result instead of being run -
+control arms must be executed, not extrapolated.
+
+### int4 Metal status change (Ping 1:10)
+
+int4_fc_repro (2-sig blockwise, the #1 minimal repro): PASSES 5/5 today.
+Production GPTQ int4 talker (fp16 scales, 2 signatures, 28L, cache 1024):
+both signatures compile; decode 19.18 ms/frame raw graph, 17.29 ms/frame
+with the composite stack (-9.9%, RTF 0.216) - int4 e2e is now the fastest
+talker config on Metal, and the composite share grew exactly as predicted
+once FCs shrank. Environment: same pin a19d8fa + only the #8796 runner
+cherry-pick, same prebuilt dylib; no explanation on our side for the
+change. Mali/CL re-check pending a supervised device session.
+
+### Op counts (Ping 1:05), serialized main-graph nodes
+
+talker 28L (per signature, prefill == decode): raw 7809; rbmm 7781; rbmm+
+rms 5551 (-29%, 502 composites per signature).
+diffusion LLaDA 32L (single denoise signature): raw 1816; sdpa 1402; rms
+1491; sdpa+rms 1077 (-41%, 97 composites). Decomposition subgraphs ride
+along (6 ops per rms, 14 per sdpa) and never run when the delegate claims.
+
+### Window-2 reproducibility check (7/23 07:2x, user active + a CPU-bound
+python job; load avg 3.4 - deliberately a DIFFERENT condition)
+
+Every claim reproduced within 1%: diff 1k fp32 154.7/148.7 (-3.9%), fp16
+135.3/131.9 (-2.5%); talker fp16 22.52/20.58 (-8.6%), fp32 30.79/28.33
+(-8.0%), int4 19.30/17.32 (-10.2%); 28L GQA 27.60/27.43 (neutral); int4
+repro 3/3 PASS; cache fill=64 fp16 18.04. The one non-reproducing item was
+the assumed cache-fp32 control -> #16 corrected (above). Note the 7/22-eve
+contamination was GPU contention specifically: window 2's CPU-bound load
+did not move Metal numbers.
+
+Logs for all of the above: notes/repro-logs-0722/ (7/23 files) plus this
+session's command lines in the KICKOFF entry.

@@ -61,6 +61,7 @@ cc_binary(
         "//litert/cc:litert_common",
         "//litert/cc:litert_environment",
         "//litert/cc:litert_options",
+        "//litert/cc/options:litert_gpu_options",
         "//tensor",
         "//tensor:datatypes",
         "//tensor/backends/tflite:tflite_flatbuffer_conversion",

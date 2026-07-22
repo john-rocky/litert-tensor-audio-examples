@@ -23,6 +23,7 @@
 #include "absl/status/status.h"  // from @com_google_absl
 #include "litert/cc/litert_environment.h"
 #include "litert/cc/litert_options.h"
+#include "litert/cc/options/litert_gpu_options.h"
 #include "tensor/backends/tflite/tflite_flatbuffer_conversion.h"
 #include "tensor/datatypes.h"
 #include "tensor/examples/diffusion_step/diffusion_graph.h"
@@ -54,6 +55,9 @@ ABSL_FLAG(int, prompt_len, 32, "Unmasked prompt prefix length");
 ABSL_FLAG(int, unmask_k, 8, "Tokens revealed per step");
 ABSL_FLAG(int, warmup, 2, "Warmup steps excluded from stats");
 ABSL_FLAG(std::string, accelerator, "cpu", "cpu|gpu");
+ABSL_FLAG(std::string, gpu_precision, "default",
+          "default|fp16|fp32 - GPU compute precision (delegate default = "
+          "fp16 on Apple silicon)");
 ABSL_FLAG(std::string, norms, "raw",
           "raw|composite - emit RMS norms as raw ops or as the "
           "odml.rms_norm composite (fused ML Drift kernels)");
@@ -197,6 +201,17 @@ absl::Status RunDiffusion() {
   options->SetHardwareAccelerators(absl::GetFlag(FLAGS_accelerator) == "gpu"
                                        ? ::litert::HwAccelerators::kGpu
                                        : ::litert::HwAccelerators::kCpu);
+  if (const std::string prec = absl::GetFlag(FLAGS_gpu_precision);
+      prec != "default") {
+    auto gpu_options = options->GetGpuOptions();
+    if (gpu_options.HasValue()) {
+      auto st = gpu_options->SetPrecision(
+          prec == "fp32" ? ::litert::GpuOptions::Precision::kFp32
+                         : ::litert::GpuOptions::Precision::kFp16);
+      if (!st) return absl::InternalError("SetPrecision failed");
+      std::cout << "gpu precision: " << prec << std::endl;
+    }
+  }
   auto runner_or = LitertDynamicRunner::Create(*env, tflite_path, *options);
   if (!runner_or.ok()) return runner_or.status();
   auto runner = std::move(*runner_or);

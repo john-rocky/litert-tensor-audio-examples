@@ -84,8 +84,10 @@ weights in this repo). Composite options: `--norms=raw|composite` (now wired
 for every shape - it was silently ignored without `--llada` before 7/22, so
 re-check any earlier 1024-dim norm numbers) and `--attention=raw|sdpa`.
 `sdpa` keeps MHA shapes plain BSND and pre-folds GQA into batched MHA
-([G, g*S, 1, D]); it is exact on Metal (real-weight probe) and -8.6%/step at
-the LLaDA shape S=1024. `sdpa_nofold` reproduces the Metal wrong-result
+([G, g*S, 1, D]); it is exact on Metal (real-weight probe, fp32 and fp16)
+and -3.8%/step (fp32) / -2.5% (fp16) at the LLaDA shape S=1024 on a quiet
+machine. `--gpu_precision=default|fp16|fp32` selects GPU compute precision
+(the delegate default is fp16 on Apple silicon). `sdpa_nofold` reproduces the Metal wrong-result
 claim for un-folded grouped K/V (FINDINGS #13); `sdpa_folddirect` runs the
 fold as plain ops for CPU-parity work (FINDINGS #14). CPU-parity
 verification: use `--attention=raw --norms=raw`.
