@@ -11,6 +11,7 @@
 #include "absl/log/absl_check.h"  // from @com_google_absl
 #include "absl/strings/str_cat.h"  // from @com_google_absl
 #include "absl/types/span.h"  // from @com_google_absl
+#include "flatbuffers/flexbuffers.h"  // from @flatbuffers
 #include "tensor/arithmetic.h"
 #include "tensor/buffer.h"
 #include "tensor/datatypes.h"
@@ -112,6 +113,63 @@ TfTensor GqaAttention(const TfTensor& q, const TfTensor& k, const TfTensor& v,
   return Reshape(out, {1, n_heads, seq, head_dim});
 }
 
+std::vector<uint8_t> RuntimeBmmAttributes(bool is_src) {
+  flexbuffers::Builder fbb;
+  fbb.Map([&]() {
+    fbb.Bool("is_global", true);
+    fbb.Bool("is_src", is_src);
+    fbb.Bool("rhs_cache_update", false);
+  });
+  fbb.Finish();
+  return fbb.GetBuffer();
+}
+
+// GQA attention via the odml.runtime_bmm composite pair in the "avbound"
+// composition: the QK side runs UNBOUNDED (runtime_param_full carries
+// max_seq) so every tail score is deterministically written and the fused
+// scale/mask epilogue covers the full width; only the scores x V side is
+// runtime-bounded (runtime_param carries the active length). A dst-bounded
+// QK would leave its output tail unwritten, which the full-width Softmax in
+// between would then read - see the attn_bench findings. The decompositions
+// are plain BatchMatMuls, so CPU execution equals the raw-op path exactly.
+// q [1, heads, seq, hd], k [1, kv, max_seq, hd], v_t [1, kv, hd, max_seq],
+// mask [1, 1|heads, seq, max_seq] additive -> output [1, heads, seq, hd].
+TfTensor RbmmGqaAttention(const TfTensor& q, const TfTensor& k,
+                          const TfTensor& v_t, const TfTensor& mask,
+                          const TfTensor& runtime_param,
+                          const TfTensor& runtime_param_full, int n_heads,
+                          int n_kv_groups, int head_dim, int max_seq) {
+  int g = n_heads / n_kv_groups;
+  int seq = q.GetShape()[2];
+  float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+
+  TfTensor qg = Reshape(q, {1, n_kv_groups, g * seq, head_dim});
+  StableHLOCompositeOptions qk_opts{
+      .name = "odml.runtime_bmm",
+      .composite_attributes = RuntimeBmmAttributes(/*is_src=*/false)};
+  TfTensor scores = StableHLOComposite(
+      qk_opts,
+      [](TfTensor l, TfTensor r, TfTensor /*p*/) {
+        return BatchMatMul(l, r, /*adj_x=*/false, /*adj_y=*/true);
+      },
+      qg, k, runtime_param_full);  // [1, kv, g*seq, max_seq]
+  scores = Reshape(scores, {1, n_heads, seq, max_seq});
+  scores = Mul(scores, Const1(scale));
+  scores = Add(scores, mask);
+  TfTensor attn = Softmax(scores);
+  attn = Reshape(attn, {1, n_kv_groups, g * seq, max_seq});
+  StableHLOCompositeOptions av_opts{
+      .name = "odml.runtime_bmm",
+      .composite_attributes = RuntimeBmmAttributes(/*is_src=*/true)};
+  TfTensor out = StableHLOComposite(
+      av_opts,
+      [](TfTensor l, TfTensor r, TfTensor /*p*/) {
+        return BatchMatMul(l, r, /*adj_x=*/false, /*adj_y=*/true);
+      },
+      attn, v_t, runtime_param);  // [1, kv, g*seq, hd]
+  return Reshape(out, {1, n_heads, seq, head_dim});
+}
+
 // Generic pre-norm GQA transformer layer used by both the talker backbone and
 // the code predictor. `k_ext`/`v_ext` (optional) provide externally updated
 // caches for attention; when null, attention runs over this call's k/v only.
@@ -156,14 +214,30 @@ AttentionResult TalkerAttention(const TalkerConfig& config,
 
   TfTensor key_cache_new = DynamicUpdateSlice(inputs.key_caches[layer_idx], k,
                                               inputs.cache_position);
-  TfTensor value_cache_new = DynamicUpdateSlice(inputs.value_caches[layer_idx],
-                                                v, inputs.cache_position);
   key_cache_new.SetName(absl::StrCat("key_cache_", layer_idx, "_new"));
-  value_cache_new.SetName(absl::StrCat("value_cache_", layer_idx, "_new"));
 
-  TfTensor out =
-      GqaAttention(q, key_cache_new, value_cache_new, inputs.attention_mask,
-                   config.n_heads, config.n_kv_groups, config.head_dim);
+  TfTensor value_cache_new;
+  TfTensor out;
+  if (config.use_runtime_bmm) {
+    // Value cache lives transposed ([1, kv, hd, max_seq]); write this call's
+    // rows as columns at the runtime position on the last axis.
+    TfTensor v_t = Transpose(v, {0, 1, 3, 2});  // [1, kv, hd, seq]
+    value_cache_new = DynamicUpdateSlice(inputs.value_caches[layer_idx], v_t,
+                                         inputs.cache_position_vt);
+    value_cache_new.SetName(absl::StrCat("value_cache_", layer_idx, "_new"));
+    out = RbmmGqaAttention(q, key_cache_new, value_cache_new,
+                           inputs.attention_mask, inputs.runtime_param,
+                           inputs.runtime_param_full, config.n_heads,
+                           config.n_kv_groups, config.head_dim,
+                           config.max_seq);
+  } else {
+    value_cache_new = DynamicUpdateSlice(inputs.value_caches[layer_idx], v,
+                                         inputs.cache_position);
+    value_cache_new.SetName(absl::StrCat("value_cache_", layer_idx, "_new"));
+    out =
+        GqaAttention(q, key_cache_new, value_cache_new, inputs.attention_mask,
+                     config.n_heads, config.n_kv_groups, config.head_dim);
+  }
 
   out = Transpose(out, {0, 2, 1, 3});
   out = Reshape(out, {1, seq, config.qkv_out_dim()});
@@ -290,6 +364,11 @@ std::vector<TfTensor> TalkerInputs::AsList(bool is_decode) const {
   list.push_back(rope_cos);
   list.push_back(rope_sin);
   list.push_back(attention_mask);
+  if (has_runtime_bmm) {
+    list.push_back(runtime_param);
+    list.push_back(runtime_param_full);
+    list.push_back(cache_position_vt);
+  }
   for (size_t i = 0; i < key_caches.size(); ++i) {
     list.push_back(key_caches[i]);
     list.push_back(value_caches[i]);
@@ -340,6 +419,17 @@ TalkerInputs MakeTalkerInputs(const TalkerConfig& config, bool is_decode) {
   inputs.attention_mask = TfTensor({.name = "attention_mask",
                                     .type = Type::kFP32,
                                     .shape = {1, 1, seq, config.max_seq}});
+  if (config.use_runtime_bmm) {
+    inputs.has_runtime_bmm = true;
+    inputs.runtime_param = TfTensor({.name = "runtime_param",
+                                     .type = Type::kI32,
+                                     .shape = {1, 1, 1, 7}});
+    inputs.runtime_param_full = TfTensor({.name = "runtime_param_full",
+                                          .type = Type::kI32,
+                                          .shape = {1, 1, 1, 7}});
+    inputs.cache_position_vt = TfTensor(
+        {.name = "cache_position_vt", .type = Type::kI32, .shape = {4}});
+  }
   inputs.key_caches.reserve(config.n_layers);
   inputs.value_caches.reserve(config.n_layers);
   for (int i = 0; i < config.n_layers; ++i) {
@@ -347,10 +437,16 @@ TalkerInputs MakeTalkerInputs(const TalkerConfig& config, bool is_decode) {
         {.name = absl::StrCat("key_cache_", i),
          .type = Type::kFP32,
          .shape = {1, config.n_kv_groups, config.max_seq, config.head_dim}}));
-    inputs.value_caches.push_back(TfTensor(
-        {.name = absl::StrCat("value_cache_", i),
-         .type = Type::kFP32,
-         .shape = {1, config.n_kv_groups, config.max_seq, config.head_dim}}));
+    std::vector<int> v_shape =
+        config.use_runtime_bmm
+            ? std::vector<int>{1, config.n_kv_groups, config.head_dim,
+                               config.max_seq}
+            : std::vector<int>{1, config.n_kv_groups, config.max_seq,
+                               config.head_dim};
+    inputs.value_caches.push_back(TfTensor({.name = absl::StrCat(
+                                                "value_cache_", i),
+                                            .type = Type::kFP32,
+                                            .shape = v_shape}));
   }
   return inputs;
 }

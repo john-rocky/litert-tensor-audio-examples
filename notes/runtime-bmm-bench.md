@@ -135,3 +135,26 @@ raw log notes/memlog-panic-0722.txt). Launch at t=0:
 3. GQA guidance: pre-fold to MHA shapes for both composites, or native grouped
    support planned? (Metal rejects grouped sdpa; CL faults at >=4 nodes.)
 4. Metal roadmap for cache_update (runtime_bmm already works app-side).
+
+## End-to-end: runtime_bmm wired into the talker decode step
+
+`talker_main --attention=rbmm` builds the backbone attention as the
+odml.runtime_bmm pair (avbound composition; value caches stored transposed
+[1, kv, head_dim, max_seq]; control tensors runtime_param /
+runtime_param_full / cache_position_vt added to both signatures).
+
+Correctness: CPU fp32 ids are bit-identical to --attention=raw (synthetic 4L
+and real-weight 28L, chained frames), and Metal GPU fp32 ids match raw
+exactly. Full-frame medians (28L real weights, max_seq 1024, M4 Max, buffer
+storage, 24 steps):
+
+| config | raw | rbmm |
+|---|---|---|
+| Metal fp16 | 22.23 ms/frame | 21.29 (-4.2%) |
+| Metal fp32 | 30.41 ms/frame | 29.02 (-4.6%) |
+| CPU fp32 | 57.27 ms/frame | 57.47 (decompositions, parity) |
+
+The attention block itself is 3x faster (see above), but the full frame is
+dominated by the FC projections and the 16-step code-predictor unroll, so
+the end-to-end gain today is ~4-5%. The share grows as the rest shrinks
+(e.g. once int4 weights run on Metal) and with longer caches.

@@ -52,6 +52,10 @@ ABSL_FLAG(int, warmup, 3, "Warmup decode steps excluded from stats");
 ABSL_FLAG(int, max_seq, 256, "Fixed KV cache length");
 ABSL_FLAG(int, prefill_len, 64, "Static prefill length");
 ABSL_FLAG(std::string, accelerator, "cpu", "cpu|gpu");
+ABSL_FLAG(std::string, attention, "raw",
+          "raw|rbmm — backbone attention as raw ops or as the "
+          "odml.runtime_bmm composite pair (avbound composition; value "
+          "caches stored transposed, runtime control tensors added)");
 ABSL_FLAG(std::string, gpu_precision, "fp16",
           "fp16|fp32 — GPU calculation precision (fp16 is the delegate "
           "default; fp32 for CPU-parity verification runs)");
@@ -158,6 +162,14 @@ absl::Status RunTalker() {
   config.n_layers = absl::GetFlag(FLAGS_layers);
   config.max_seq = absl::GetFlag(FLAGS_max_seq);
   config.prefill_len = absl::GetFlag(FLAGS_prefill_len);
+  const std::string attention = absl::GetFlag(FLAGS_attention);
+  if (attention != "raw" && attention != "rbmm") {
+    return absl::InvalidArgumentError("--attention must be raw|rbmm");
+  }
+  config.use_runtime_bmm = attention == "rbmm";
+  if (config.use_runtime_bmm) {
+    std::cout << "attention: odml.runtime_bmm (avbound)" << std::endl;
+  }
   const int steps = absl::GetFlag(FLAGS_steps);
   const int warmup = absl::GetFlag(FLAGS_warmup);
   const std::string tflite_path = absl::GetFlag(FLAGS_tflite_path);
@@ -308,6 +320,26 @@ absl::Status RunTalker() {
                          Create("cache_position", Type::kI32, {4},
                                 std::vector<int32_t>{0, 0, pos, 0}));
     if (!st.ok()) return st;
+    if (config.use_runtime_bmm) {
+      // AV-side active length must cover every position any query row can
+      // attend: BuildMask lets row s reach valid_len + s + 1 positions, so
+      // the max over rows is valid_len + seq (prefill: 0 + 64; decode:
+      // pos + 1).
+      const int active = std::min(valid_len + seq, config.max_seq);
+      st = runner.SetInput(sig, "runtime_param",
+                           Create("runtime_param", Type::kI32, {1, 1, 1, 7},
+                                  std::vector<int32_t>(7, active)));
+      if (!st.ok()) return st;
+      st = runner.SetInput(
+          sig, "runtime_param_full",
+          Create("runtime_param_full", Type::kI32, {1, 1, 1, 7},
+                 std::vector<int32_t>(7, config.max_seq)));
+      if (!st.ok()) return st;
+      st = runner.SetInput(sig, "cache_position_vt",
+                           Create("cache_position_vt", Type::kI32, {4},
+                                  std::vector<int32_t>{0, 0, 0, pos}));
+      if (!st.ok()) return st;
+    }
     BuildRopeCosSin(pos, seq, hd, config.rope_base, cos_v, sin_v);
     st = runner.SetInput(sig, "rope_cos",
                          Create("rope_cos", Type::kFP32, {1, 1, seq, hd},
@@ -362,11 +394,14 @@ absl::Status RunTalker() {
                  {1, config.n_kv_groups, config.max_seq, hd},
                  std::vector<float>(n, 0.0f)));
       if (!st.ok()) return st;
+      std::vector<int> v_shape =
+          config.use_runtime_bmm
+              ? std::vector<int>{1, config.n_kv_groups, hd, config.max_seq}
+              : std::vector<int>{1, config.n_kv_groups, config.max_seq, hd};
       st = runner.SetInput(
           "prefill", absl::StrCat("value_cache_", i),
           Create(absl::StrCat("value_cache_", i).c_str(), Type::kFP32,
-                 {1, config.n_kv_groups, config.max_seq, hd},
-                 std::vector<float>(n, 0.0f)));
+                 v_shape, std::vector<float>(n, 0.0f)));
       if (!st.ok()) return st;
     }
     st = runner.Run("prefill");

@@ -38,6 +38,12 @@ struct TalkerConfig {
   // rounds down. RTF budgets must use 80 ms, not 83.3.
   double frame_rate_hz = 12.5;
 
+  // Backbone attention via odml.runtime_bmm composites (the "avbound"
+  // composition: QK unbounded so the fused mask epilogue covers the full
+  // width, AV side runtime-bounded). Changes the value-cache layout to
+  // [1, kv, head_dim, max_seq] and adds runtime control-tensor inputs.
+  bool use_runtime_bmm = false;
+
   int qkv_out_dim() const { return n_heads * head_dim; }
   int kv_out_dim() const { return n_kv_groups * head_dim; }
   int num_sub_groups() const { return num_code_groups - 1; }

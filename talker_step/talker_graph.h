@@ -59,9 +59,20 @@ struct TalkerInputs {
   TfTensor rope_sin;
   // decode: [1, 1, 1, max_seq]; prefill: [1, 1, prefill_len, max_seq].
   TfTensor attention_mask;
-  // Per layer: [1, n_kv_groups, max_seq, head_dim] kFP32.
+  // Per layer: [1, n_kv_groups, max_seq, head_dim] kFP32. With
+  // use_runtime_bmm the VALUE caches are stored transposed,
+  // [1, n_kv_groups, head_dim, max_seq], so valid positions sit on channels
+  // for the src-bounded scores x V composite.
   std::vector<TfTensor> key_caches;
   std::vector<TfTensor> value_caches;
+  // use_runtime_bmm only: odml.runtime_bmm control tensors, int32 [1,1,1,7]
+  // with element 2 = active token count (runtime_param) / max_seq
+  // (runtime_param_full, keeps the QK side unbounded), plus the value-cache
+  // write position as [4] {0,0,0,position} (cache_position_vt).
+  TfTensor runtime_param;
+  TfTensor runtime_param_full;
+  TfTensor cache_position_vt;
+  bool has_runtime_bmm = false;
 
   std::vector<TfTensor> AsList(bool is_decode) const;
 };
