@@ -158,3 +158,19 @@ The attention block itself is 3x faster (see above), but the full frame is
 dominated by the FC projections and the 16-step code-predictor unroll, so
 the end-to-end gain today is ~4-5%. The share grows as the rest shrinks
 (e.g. once int4 weights run on Metal) and with longer caches.
+
+## odml.cache_update pairing (first probe, 2026-07-22)
+
+`attn_bench --variant=cache_rbmm` builds one decode step as
+odml.cache_update (7-input form; CPU decomposition = DYNAMIC_UPDATE_SLICE)
+feeding the odml.runtime_bmm pair. On Metal the delegate matches the
+composite and the step runs at ~0.35 ms, exact vs CPU at fill=1. Learned
+contract: the GPU caches are delegate-managed (K written in the QK
+FC-weights layout kOSpatialIOGroupO4I4, V in kOSpatialIOGroupI4O4; the
+host-provided cache inputs are consumed only by the CPU decomposition -
+the runner warns "Failed to get buffer requirements" for them, which is
+the expected signature of the composite being claimed). Control tensor
+slots: [0] write offset, [1] active tokens (cache_update), [2] active
+bound (runtime_bmm). Multi-fill single-shot numerics intentionally diverge
+on GPU (state accumulates across calls, not from host inputs); a
+multi-step harness is the next step before talker adoption.

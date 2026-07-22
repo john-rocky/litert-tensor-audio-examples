@@ -62,7 +62,12 @@
 #include "tensor/runners/litert/litert_dynamic_runner.h"
 #include "tensor/tensor.h"
 
-ABSL_FLAG(std::string, variant, "raw", "raw|sdpa|rbmm");
+ABSL_FLAG(std::string, variant, "raw", "raw|sdpa|rbmm|cache_rbmm");
+ABSL_FLAG(bool, cache_qk_bound, false,
+          "cache_rbmm only: bound the QK side with the active length instead "
+          "of running it unbounded (probes the intended composition for "
+          "delegate-managed caches, where the host cannot pre-zero the "
+          "packed cache storage)");
 ABSL_FLAG(std::string, accelerator, "cpu", "cpu|gpu");
 ABSL_FLAG(int, blocks, 28, "chained attention blocks (one talker frame = 28)");
 ABSL_FLAG(int, heads, 16, "query heads");
@@ -115,6 +120,7 @@ using ::litert::tensor::ModelFactory;
 using ::litert::tensor::Mul;
 using ::litert::tensor::OwningCpuBuffer;
 using ::litert::tensor::Div;
+using ::litert::tensor::DynamicUpdateSlice;
 using ::litert::tensor::Reshape;
 using ::litert::tensor::Slice;
 using ::litert::tensor::Softmax;
@@ -266,6 +272,80 @@ TfTensor RuntimeBmmBlock(const Geometry& g, const TfTensor& qf,
   return out;
 }
 
+std::vector<uint8_t> CacheUpdateAttributes(int kv_cache_batch_size,
+                                           int cache_size, int head_size) {
+  flexbuffers::Builder fbb;
+  fbb.Map([&]() {
+    fbb.Int("kv_cache_batch_size", kv_cache_batch_size);
+    fbb.Int("cache_size", cache_size);
+    fbb.Int("head_size", head_size);
+  });
+  fbb.Finish();
+  return fbb.GetBuffer();
+}
+
+// One decode step through the odml.cache_update + odml.runtime_bmm pair -
+// the fused write/read pattern the delegate implements (cache_update stores
+// K in the QK FC-weights layout and V in the AV layout; runtime_bmm's
+// FC-external-weights path engages because the RHS producer is
+// add_values_to_cache). The composite carries 7 inputs so the CPU
+// decomposition can express the same update as DYNAMIC_UPDATE_SLICE
+// (src_k, src_v, control tensor, k cache, v cache, and the two write-index
+// vectors); the GPU parser reads only the first three. Control tensor
+// element 0 = write offset, element 1 = active tokens (cache_update),
+// element 2 = active tokens (runtime_bmm bound).
+TfTensor CacheRbmmStep(const Geometry& g, const TfTensor& q,
+                       const TfTensor& src_k, const TfTensor& src_v,
+                       const TfTensor& mask, const TfTensor& param,
+                       const TfTensor& param_full, const TfTensor& cache_k_in,
+                       const TfTensor& cache_v_in, const TfTensor& pos_k,
+                       const TfTensor& pos_v, bool qk_bound) {
+  const float scale = 1.0f / std::sqrt(static_cast<float>(g.head_dim));
+  StableHLOCompositeOptions cu_opts{
+      .name = "odml.cache_update",
+      .composite_attributes = CacheUpdateAttributes(
+          g.groups, g.max_seq, g.head_dim)};
+  auto caches = StableHLOComposite(
+      cu_opts,
+      [](TfTensor sk, TfTensor sv, TfTensor /*p*/, TfTensor ck, TfTensor cv,
+         TfTensor pk, TfTensor pv) {
+        TfTensor k_new = DynamicUpdateSlice(ck, sk, pk);
+        // V cache is stored transposed ([1, G, D, S]); write this step's row
+        // as a column.
+        TfTensor sv_t = Transpose(sv, {0, 1, 3, 2});
+        TfTensor v_new = DynamicUpdateSlice(cv, sv_t, pv);
+        return std::make_tuple(k_new, v_new);
+      },
+      src_k, src_v, param, cache_k_in, cache_v_in, pos_k, pos_v);
+  TfTensor cache_k_new = std::get<0>(caches);
+  TfTensor cache_v_new = std::get<1>(caches);
+  cache_k_new.SetName("cache_k_new");
+  cache_v_new.SetName("cache_v_new");
+
+  TfTensor lhs = Mul(q, Const1(scale));
+  StableHLOCompositeOptions qk_opts{
+      .name = "odml.runtime_bmm",
+      .composite_attributes = RuntimeBmmAttributes(/*is_src=*/false)};
+  TfTensor scores = StableHLOComposite(
+      qk_opts,
+      [](TfTensor l, TfTensor r, TfTensor /*p*/) {
+        return BatchMatMul(l, r, /*adj_x=*/false, /*adj_y=*/true);
+      },
+      lhs, cache_k_new, qk_bound ? param : param_full);
+  scores = Add(scores, mask);
+  TfTensor attn = Softmax(scores);
+  StableHLOCompositeOptions av_opts{
+      .name = "odml.runtime_bmm",
+      .composite_attributes = RuntimeBmmAttributes(/*is_src=*/true)};
+  TfTensor out = StableHLOComposite(
+      av_opts,
+      [](TfTensor l, TfTensor r, TfTensor /*p*/) {
+        return BatchMatMul(l, r, /*adj_x=*/false, /*adj_y=*/true);
+      },
+      attn, cache_v_new, param);
+  return out;  // [1, G, gsz, D]
+}
+
 struct HostData {
   std::vector<float> q;         // H*D, block-0 query
   std::vector<float> k;         // G*S*D logical [g][s][d]
@@ -338,6 +418,72 @@ absl::Status SetCommonInputs(LitertDynamicRunner& runner,
                              const HostData& data, int active, float canary,
                              bool param_align4) {
   auto st = absl::OkStatus();
+  if (variant == "cache_rbmm") {
+    // The step writes position active-1; the cache inputs carry positions
+    // [0, active-1) and the composite adds the last row.
+    const int pos = active - 1;
+    st = runner.SetInput("main", "q",
+                         Create("q", Type::kFP32,
+                                {1, g.groups, g.group_sz, g.head_dim},
+                                std::vector<float>(data.q)));
+    if (!st.ok())
+      return absl::InternalError(absl::StrCat("q: ", st.message()));
+    std::vector<float> row_k(static_cast<size_t>(g.groups) * g.head_dim);
+    std::vector<float> row_v(row_k.size());
+    for (int gi = 0; gi < g.groups; ++gi)
+      for (int di = 0; di < g.head_dim; ++di) {
+        size_t src = (static_cast<size_t>(gi) * g.max_seq + pos) * g.head_dim +
+                     di;
+        row_k[static_cast<size_t>(gi) * g.head_dim + di] = data.k[src];
+        row_v[static_cast<size_t>(gi) * g.head_dim + di] = data.v[src];
+      }
+    st = runner.SetInput("main", "src_k",
+                         Create("src_k", Type::kFP32,
+                                {1, g.groups, 1, g.head_dim},
+                                std::move(row_k)));
+    if (!st.ok()) return absl::InternalError(absl::StrCat("src_k: ", st.message()));
+    st = runner.SetInput("main", "src_v",
+                         Create("src_v", Type::kFP32,
+                                {1, g.groups, 1, g.head_dim},
+                                std::move(row_v)));
+    if (!st.ok()) return absl::InternalError(absl::StrCat("src_v: ", st.message()));
+    st = runner.SetInput("main", "cache_k_in",
+                         Create("cache_k_in", Type::kFP32,
+                                {1, g.groups, g.max_seq, g.head_dim},
+                                PackBnsd(g, data.k, pos, 0.0f)));
+    if (!st.ok()) return absl::InternalError(absl::StrCat("cache_k_in: ", st.message()));
+    st = runner.SetInput("main", "cache_v_in",
+                         Create("cache_v_in", Type::kFP32,
+                                {1, g.groups, g.head_dim, g.max_seq},
+                                PackTransposed(g, data.v, pos, 0.0f)));
+    if (!st.ok()) return absl::InternalError(absl::StrCat("cache_v_in: ", st.message()));
+    std::vector<int32_t> p(7, active);
+    p[0] = pos;
+    st = runner.SetInput("main", "param",
+                         Create("param", Type::kI32, {1, 1, 1, 7},
+                                std::move(p)));
+    if (!st.ok()) return absl::InternalError(absl::StrCat("param: ", st.message()));
+    std::vector<int32_t> pf(7, g.max_seq);
+    pf[0] = pos;
+    pf[1] = active;
+    st = runner.SetInput("main", "param_full",
+                         Create("param_full", Type::kI32, {1, 1, 1, 7},
+                                std::move(pf)));
+    if (!st.ok()) return absl::InternalError(absl::StrCat("param_full: ", st.message()));
+    st = runner.SetInput("main", "pos_k",
+                         Create("pos_k", Type::kI32, {4},
+                                std::vector<int32_t>{0, 0, pos, 0}));
+    if (!st.ok()) return absl::InternalError(absl::StrCat("pos_k: ", st.message()));
+    st = runner.SetInput("main", "pos_v",
+                         Create("pos_v", Type::kI32, {4},
+                                std::vector<int32_t>{0, 0, 0, pos}));
+    if (!st.ok()) return absl::InternalError(absl::StrCat("pos_v: ", st.message()));
+    st = runner.SetInput("main", "mask",
+                         Create("mask", Type::kFP32, {1, 1, 1, g.max_seq},
+                                MakeMask(g.max_seq, active)));
+    if (!st.ok()) return absl::InternalError(absl::StrCat("mask: ", st.message()));
+    return absl::OkStatus();
+  }
   if (variant == "raw" || variant == "rbmm") {
     std::vector<int> q_shape = variant == "raw"
                                    ? std::vector<int>{1, g.heads, 1, g.head_dim}
@@ -416,8 +562,10 @@ absl::Status SetCommonInputs(LitertDynamicRunner& runner,
 
 absl::Status RunBench() {
   const std::string variant = absl::GetFlag(FLAGS_variant);
-  if (variant != "raw" && variant != "sdpa" && variant != "rbmm") {
-    return absl::InvalidArgumentError("--variant must be raw|sdpa|rbmm");
+  if (variant != "raw" && variant != "sdpa" && variant != "rbmm" &&
+      variant != "cache_rbmm") {
+    return absl::InvalidArgumentError(
+        "--variant must be raw|sdpa|rbmm|cache_rbmm");
   }
   const bool mha = absl::GetFlag(FLAGS_mha);
   Geometry g;
@@ -463,7 +611,7 @@ absl::Status RunBench() {
     for (int b = 0; b < blocks; ++b) x = SdpaBlock(g, x, k, v, mask);
     out = x;
     inputs = {q, k, v, mask};
-  } else {  // rbmm
+  } else if (variant == "rbmm") {
     TfTensor q({.name = "q",
                 .type = Type::kFP32,
                 .shape = {1, g.groups, g.group_sz, g.head_dim}});
@@ -509,6 +657,40 @@ absl::Status RunBench() {
     } else {
       inputs = {q, k, v_t, mask, param, param_full};
     }
+  }
+  if (variant == "cache_rbmm") {
+    // Single decode step through cache_update + runtime_bmm; the cache is
+    // threaded through the composite, so block-chaining does not apply.
+    TfTensor q({.name = "q",
+                .type = Type::kFP32,
+                .shape = {1, g.groups, g.group_sz, g.head_dim}});
+    TfTensor src_k({.name = "src_k",
+                    .type = Type::kFP32,
+                    .shape = {1, g.groups, 1, g.head_dim}});
+    TfTensor src_v({.name = "src_v",
+                    .type = Type::kFP32,
+                    .shape = {1, g.groups, 1, g.head_dim}});
+    TfTensor param({.name = "param",
+                    .type = Type::kI32,
+                    .shape = {1, 1, 1, 7}});
+    TfTensor param_full({.name = "param_full",
+                         .type = Type::kI32,
+                         .shape = {1, 1, 1, 7}});
+    TfTensor cache_k_in({.name = "cache_k_in",
+                         .type = Type::kFP32,
+                         .shape = {1, g.groups, g.max_seq, g.head_dim}});
+    TfTensor cache_v_in({.name = "cache_v_in",
+                         .type = Type::kFP32,
+                         .shape = {1, g.groups, g.head_dim, g.max_seq}});
+    TfTensor pos_k({.name = "pos_k", .type = Type::kI32, .shape = {4}});
+    TfTensor pos_v({.name = "pos_v", .type = Type::kI32, .shape = {4}});
+    TfTensor step =
+        CacheRbmmStep(g, q, src_k, src_v, mask, param, param_full, cache_k_in,
+                      cache_v_in, pos_k, pos_v,
+                      absl::GetFlag(FLAGS_cache_qk_bound));
+    out = Reshape(step, {1, g.heads, 1, g.head_dim});
+    inputs = {q,          src_k, src_v, mask,  param,
+              param_full, cache_k_in,   cache_v_in, pos_k, pos_v};
   }
   out.SetName("out");
 
