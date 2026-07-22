@@ -174,3 +174,15 @@ slots: [0] write offset, [1] active tokens (cache_update), [2] active
 bound (runtime_bmm). Multi-fill single-shot numerics intentionally diverge
 on GPU (state accumulates across calls, not from host inputs); a
 multi-step harness is the next step before talker adoption.
+
+## odml.rms_norm adoption (2026-07-22)
+
+`--norms=composite` in talker_main and diffusion_main emits every RMS norm
+as the odml.rms_norm composite ({epsilon} attr, constant 1-D scale;
+decomposition = the raw MEAN/RSQRT/MUL math, CPU bit-identical). Talker 28L
+real weights on M4 Metal: fp32 29.0 -> 28.1 ms/frame, fp16 21.3 -> 20.3 on
+top of --attention=rbmm; the combined composite stack is -7.5% (fp32) /
+-8.6% (fp16) vs the original raw graph. Diffusion (both the 1024-dim and
+4096-dim shapes): neutral within run-to-run noise. Caveat: the fused
+kernel's reduction order differs from the decomposition, so fp32 GPU greedy
+id trajectories shift; CPU-parity verification should run --norms=raw.

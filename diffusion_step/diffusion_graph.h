@@ -1,0 +1,80 @@
+// Diffusion-LM denoise-step scaffold — Stage 0 (synthetic weights).
+//
+// One masked-diffusion denoise step (LLaDA-style) authored on the LiteRT
+// Tensor API TfLite backend. The whole per-step schedule is IN-GRAPH:
+// bidirectional transformer over the full sequence (no causal mask, no KV
+// cache) -> logits -> greedy predictions + confidence -> pick the top-k most
+// confident still-masked positions (TopK + OneHot + SelectV2 — no ScatterNd
+// needed) -> emit the updated token ids. The host loop only feeds ids back
+// for T = masked/k steps.
+//
+// Everything uses ops with tflite emission today; no Custom().
+
+#ifndef SPEECHLM_STAGE1_DIFFUSION_STEP_DIFFUSION_GRAPH_H_
+#define SPEECHLM_STAGE1_DIFFUSION_STEP_DIFFUSION_GRAPH_H_
+
+#include <string>
+#include <vector>
+
+#include "absl/container/flat_hash_map.h"  // from @com_google_absl
+#include "tensor/backends/tflite/arithmetic_tflite.h"
+#include "tensor/tensor.h"
+
+namespace litert::tensor::examples::diffusion {
+
+using TfTensor = ::litert::tensor::Tensor<::litert::tensor::TfLiteMixinTag>;
+using WeightMap = absl::flat_hash_map<std::string, TfTensor>;
+
+struct DiffusionConfig {
+  // Backbone (Qwen3-0.6B-shaped placeholder; LLaDA-style models are larger —
+  // Stage 1 aligns dims with the chosen checkpoint).
+  int emb_dim = 1024;
+  int n_layers = 28;
+  int n_heads = 16;
+  int n_kv_groups = 8;
+  int head_dim = 128;
+  int hidden_dim = 3072;
+  float rms_norm_eps = 1e-6f;
+  float rope_base = 1000000.0f;
+  // Qwen3 applies per-head RMSNorm to q/k; LLaMA/OLMo-family (LLaDA) does not.
+  bool use_qk_norm = true;
+  // Emit RMS norms as the odml.rms_norm composite (fused ML Drift kernels;
+  // decomposition = the raw math, so CPU execution is unchanged).
+  bool use_rms_norm_composite = false;
+
+  int seq_len = 256;    // full (fixed) generation window
+  int vocab = 32000;    // placeholder vocab
+  int mask_id = 31999;  // [MASK] token id (placeholder)
+  int unmask_k = 8;     // tokens revealed per step (static per signature)
+
+  int qkv_out_dim() const { return n_heads * head_dim; }
+  int kv_out_dim() const { return n_kv_groups * head_dim; }
+};
+
+struct DiffusionInputs {
+  TfTensor token_ids;  // [1, seq_len] kI32, mask_id at still-masked positions
+  TfTensor rope_cos;   // [1, 1, seq_len, head_dim]
+  TfTensor rope_sin;   // [1, 1, seq_len, head_dim]
+
+  std::vector<TfTensor> AsList() const;
+};
+
+struct DiffusionOutputs {
+  TfTensor new_token_ids;  // [1, seq_len] kI32, k more positions revealed
+  TfTensor masked_count;   // [1] kI32 — remaining masked positions (host stop)
+
+  std::vector<TfTensor> AsList() const;
+};
+
+DiffusionInputs MakeDiffusionInputs(const DiffusionConfig& config);
+
+WeightMap MakeSyntheticWeights(const DiffusionConfig& config, unsigned seed);
+
+// Traces one denoise step over `inputs`.
+DiffusionOutputs BuildDenoiseStep(const DiffusionConfig& config,
+                                  const DiffusionInputs& inputs,
+                                  const WeightMap& weights);
+
+}  // namespace litert::tensor::examples::diffusion
+
+#endif  // SPEECHLM_STAGE1_DIFFUSION_STEP_DIFFUSION_GRAPH_H_

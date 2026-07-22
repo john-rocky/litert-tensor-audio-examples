@@ -52,6 +52,9 @@ ABSL_FLAG(int, warmup, 3, "Warmup decode steps excluded from stats");
 ABSL_FLAG(int, max_seq, 256, "Fixed KV cache length");
 ABSL_FLAG(int, prefill_len, 64, "Static prefill length");
 ABSL_FLAG(std::string, accelerator, "cpu", "cpu|gpu");
+ABSL_FLAG(std::string, norms, "raw",
+          "raw|composite - emit RMS norms as raw ops or as the "
+          "odml.rms_norm composite (fused ML Drift kernels)");
 ABSL_FLAG(std::string, attention, "raw",
           "raw|rbmm — backbone attention as raw ops or as the "
           "odml.runtime_bmm composite pair (avbound composition; value "
@@ -167,6 +170,14 @@ absl::Status RunTalker() {
     return absl::InvalidArgumentError("--attention must be raw|rbmm");
   }
   config.use_runtime_bmm = attention == "rbmm";
+  const std::string norms = absl::GetFlag(FLAGS_norms);
+  if (norms != "raw" && norms != "composite") {
+    return absl::InvalidArgumentError("--norms must be raw|composite");
+  }
+  config.use_rms_norm_composite = norms == "composite";
+  if (config.use_rms_norm_composite) {
+    std::cout << "norms: odml.rms_norm composite" << std::endl;
+  }
   if (config.use_runtime_bmm) {
     std::cout << "attention: odml.runtime_bmm (avbound)" << std::endl;
   }

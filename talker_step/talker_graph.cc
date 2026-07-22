@@ -60,13 +60,38 @@ const TfTensor& GetWeight(const WeightMap& weights, const std::string& name) {
   return it->second;
 }
 
-// RMS normalization composed from primitives (fused RmsNorm is ML-Drift-only).
-TfTensor RmsNorm(const TfTensor& input, const TfTensor& scale, float eps) {
+// Toggled per BuildTalkerStep call from TalkerConfig::use_rms_norm_composite
+// (single-threaded graph construction).
+bool g_rms_norm_composite = false;
+
+// RMS normalization composed from primitives.
+TfTensor RmsNormRaw(const TfTensor& input, const TfTensor& scale, float eps) {
   TfTensor x_squared = Mul(input, input);
   int last_axis = static_cast<int>(input.GetShape().size()) - 1;
   TfTensor mean_squared = Mean(x_squared, {last_axis}, /*keep_dims=*/true);
   TfTensor inv_rms = Rsqrt(Add(mean_squared, Const1(eps)));
   return Mul(Mul(input, inv_rms), scale);
+}
+
+std::vector<uint8_t> RmsNormAttributes(float eps) {
+  flexbuffers::Builder fbb;
+  fbb.Map([&]() { fbb.Float("epsilon", eps); });
+  fbb.Finish();
+  return fbb.GetBuffer();
+}
+
+// RMS norm, optionally as the odml.rms_norm composite (fused ML Drift
+// kernels on Metal and CL; the decomposition is the raw math, so CPU
+// execution is identical either way).
+TfTensor RmsNorm(const TfTensor& input, const TfTensor& scale, float eps) {
+  if (!g_rms_norm_composite) return RmsNormRaw(input, scale, eps);
+  StableHLOCompositeOptions opts{.name = "odml.rms_norm",
+                                 .composite_attributes =
+                                     RmsNormAttributes(eps)};
+  return StableHLOComposite(
+      opts,
+      [eps](TfTensor x, TfTensor s) { return RmsNormRaw(x, s, eps); }, input,
+      scale);
 }
 
 TfTensor Silu(const TfTensor& x) { return Mul(x, Logistic(x)); }
@@ -506,6 +531,7 @@ WeightMap MakeSyntheticWeights(const TalkerConfig& config, unsigned seed) {
 TalkerOutputs BuildTalkerStep(const TalkerConfig& config,
                               const TalkerInputs& inputs,
                               const WeightMap& weights, bool is_decode) {
+  g_rms_norm_composite = config.use_rms_norm_composite;
   const TfTensor& codec_table =
       GetWeight(weights, "talker.model.codec_embedding.weight");
 

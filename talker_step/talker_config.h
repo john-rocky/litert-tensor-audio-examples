@@ -44,6 +44,11 @@ struct TalkerConfig {
   // [1, kv, head_dim, max_seq] and adds runtime control-tensor inputs.
   bool use_runtime_bmm = false;
 
+  // Emit every RMS norm as the odml.rms_norm composite (epsilon attr,
+  // constant 1-D scale input; decomposition = the raw MEAN/RSQRT/MUL math,
+  // so CPU execution is unchanged). Fused kernels exist on Metal and CL.
+  bool use_rms_norm_composite = false;
+
   int qkv_out_dim() const { return n_heads * head_dim; }
   int kv_out_dim() const { return n_kv_groups * head_dim; }
   int num_sub_groups() const { return num_code_groups - 1; }

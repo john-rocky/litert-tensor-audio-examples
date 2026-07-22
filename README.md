@@ -1,4 +1,4 @@
-# LiteRT Tensor API audio-LM examples (Qwen3-TTS 0.6B)
+# LiteRT Tensor API audio-LM examples (Qwen3-TTS 0.6B + diffusion-LM)
 
 A working audio-LM decode loop authored directly with the [LiteRT Tensor
 API](https://github.com/google-ai-edge/LiteRT/tree/main/tensor) — no
@@ -64,3 +64,12 @@ two bounded matmuls ("avbound"), and per-backend findings:
 RSS logging, fsync per line) used to capture the Mali delegate-init OOM
 timeline in `notes/memlog-panic-0722.txt`. WARNING: running the launcher on
 an 8 GB phone kernel-panics and reboots it - supervised runs only.
+
+## diffusion_step: bidirectional denoise step (second model)
+
+`diffusion_step/` is the second model in the coverage program: one in-graph
+denoise step (bidirectional backbone + ScatterNd-free top-k remasking),
+LLaDA-8B-compatible via `--llada` (sharded safetensors loader included, no
+weights in this repo). Shares the composite options with the talker
+(`--norms=composite`); sdpa adoption for its full-sequence attention is next
+on the coverage list (COMPOSITES.md).
