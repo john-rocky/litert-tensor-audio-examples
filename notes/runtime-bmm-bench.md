@@ -1,6 +1,6 @@
 # odml.runtime_bmm vs sdpa vs raw attention — bench + contract findings (2026-07-22)
 
-Prompted by a suggestion from the LiteRT team (2026-07-22): use odml.runtime_bmm for the qwen3_tts talker and compare
+Goal (2026-07-22): use odml.runtime_bmm for the qwen3_tts talker and compare
 against scaled_dot_product_attention. Tool: `attn_bench.cc` (talker_step/, synced
 both copies; BUILD target `attn_bench`). 28 chained decode-shape attention blocks
 (heads 16 / kv 8 / head_dim 128 / cache 1024, q_seq 1), one graph per variant,
@@ -126,7 +126,7 @@ raw log notes/memlog-panic-0722.txt). Launch at t=0:
   /data/local/tmp/qwen3tts with LD_LIBRARY_PATH=. ; OOM repro via launcher.sh
   (memlog.sh + talker_main 4L GPU serialization) — REBOOTS THE DEVICE.
 
-## Open questions (raised with the LiteRT team)
+## Open questions
 
 1. Intended composition for bounding the softmax between two runtime_bmms
    (runtime-aware softmax? -inf tail fill? our avbound workaround keeps 3x).

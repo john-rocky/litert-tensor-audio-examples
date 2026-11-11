@@ -2,8 +2,8 @@
 
 Goal: adopt and benchmark each odml composite / custom op across these
 examples, one at a time, and report what we find - a running showcase of the
-composite path from an external C++ Tensor API user. Suggested by the LiteRT
-team's pointers (sdpa, runtime_bmm); we continue down the list.
+composite path from an external C++ Tensor API user. Started with sdpa and
+runtime_bmm; we continue down the list.
 
 | composite | status here | measured / notes |
 |---|---|---|

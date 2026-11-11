@@ -181,8 +181,8 @@ because step t's mask admits only rows 0..t, all written by steps <= t.
 - FINDINGS.md #13/#14/#15 (public repo) — one-command repros for all three.
 - notes/repro-logs-0722/ — issue-ready RAW LOGS for #13/#14/#15, regenerated
   from the one-liners after the session (numbers reproduce bit-for-bit incl.
-  worst-element values); attach these (or a fresh capture) if Ping green-lights
-  the GitHub issues.
+  worst-element values); attach these (or a fresh capture) if GitHub issues
+  are filed.
 - COMPOSITES.md — sdpa row (adopted for diffusion), rms row (corrected
   numbers), cache_update row (multi-step + #8796 status), adoption matrix.
 - Repro one-liners: FINDINGS #13 `diffusion_main --attention=sdpa_nofold
@@ -194,7 +194,7 @@ because step t's mask admits only rows 0..t, all written by steps <= t.
   --multi_steps=8 --feedback_loops`.
 
 
-## 7/23 addendum — clean-machine re-baseline + Ping's 4 follow-ups
+## 7/23 addendum — clean-machine re-baseline + 4 follow-ups
 
 Host idle (early morning); every arm re-run. Two 7/22 labeling/condition
 errors corrected below; talker numbers REPRODUCED, diffusion numbers were
@@ -221,7 +221,7 @@ contaminated.
 3. Real-weight k=56 probe at EXPLICIT precisions: GPU raw and sdpa both
    0/64 vs CPU at fp32 AND fp16 - the exactness claim survives with labels.
 
-### fp16 sweep (Ping 3:31 "GPU seems fp32-only") — CORRECTED same day
+### fp16 sweep — CORRECTED same day
 
 attn_bench fill=64, default fp16, Metal: raw max_rel 0.056 (rounding-scale,
 fine); rbmm 0.069, 0.945 ms (fine); GQA sdpa = CPU-fallback bit-exact
@@ -234,7 +234,7 @@ rewritten as a harness-contract note. Lesson: the fp32 control was
 initially assumed from the 7/22 fill=1 result instead of being run -
 control arms must be executed, not extrapolated.
 
-### int4 Metal status change (Ping 1:10)
+### int4 Metal status change
 
 int4_fc_repro (2-sig blockwise, the #1 minimal repro): PASSES 5/5 today.
 Production GPTQ int4 talker (fp16 scales, 2 signatures, 28L, cache 1024):
@@ -245,7 +245,7 @@ once FCs shrank. Environment: same pin a19d8fa + only the #8796 runner
 cherry-pick, same prebuilt dylib; no explanation on our side for the
 change. Mali/CL re-check pending a supervised device session.
 
-### Op counts (Ping 1:05), serialized main-graph nodes
+### Op counts, serialized main-graph nodes
 
 talker 28L (per signature, prefill == decode): raw 7809; rbmm 7781; rbmm+
 rms 5551 (-29%, 502 composites per signature).
